@@ -1,0 +1,11 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: esp32-audio-server
+
+logging:
+  level:
+    cn.ccsu.esp32: DEBUG
+    org.springframework.web.socket: INFO
