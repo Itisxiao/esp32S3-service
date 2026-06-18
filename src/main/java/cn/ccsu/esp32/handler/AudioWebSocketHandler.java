@@ -51,20 +51,29 @@ public class AudioWebSocketHandler extends AbstractWebSocketHandler {
     }
 
     @Override
-    protected void handleTextMessage(WebSocketSession session, TextMessage message) throws Exception {
+    protected void handleTextMessage(WebSocketSession session, TextMessage message) {
         String payload = message.getPayload();
         String sessionId = session.getId();
         log.info("收到控制指令, sessionId={}, 内容={}", sessionId, payload);
 
-        if (payload.contains("\"start\"")) {
-            audioService.startRecording(sessionId);
-            session.sendMessage(new TextMessage("{\"status\":\"recording\"}"));
-        } else if (payload.contains("\"stop\"")) {
-            String filePath = audioService.stopRecording(sessionId);
-            String response = filePath != null
-                    ? "{\"status\":\"stopped\",\"file\":\"" + filePath + "\"}"
-                    : "{\"status\":\"stopped\",\"file\":null}";
-            session.sendMessage(new TextMessage(response));
+        try {
+            if (payload.contains("\"start\"")) {
+                log.info("执行开始录音, sessionId={}", sessionId);
+                audioService.startRecording(sessionId);
+                session.sendMessage(new TextMessage("{\"status\":\"recording\"}"));
+            } else if (payload.contains("\"stop\"")) {
+                log.info("执行停止录音, sessionId={}", sessionId);
+                String filePath = audioService.stopRecording(sessionId);
+                log.info("停止录音完成, sessionId={}, filePath={}", sessionId, filePath);
+                String response = filePath != null
+                        ? "{\"status\":\"stopped\",\"file\":\"" + filePath + "\"}"
+                        : "{\"status\":\"stopped\",\"file\":null}";
+                session.sendMessage(new TextMessage(response));
+            } else {
+                log.warn("未识别的控制指令, sessionId={}, payload={}", sessionId, payload);
+            }
+        } catch (Exception e) {
+            log.error("处理控制指令异常, sessionId={}, payload={}", sessionId, payload, e);
         }
     }
 
@@ -90,5 +99,53 @@ public class AudioWebSocketHandler extends AbstractWebSocketHandler {
      */
     public int getOnlineCount() {
         return sessions.size();
+    }
+
+    /**
+     * 向所有已连接的ESP32设备发送音频数据
+     * @param audioData 音频二进制数据
+     * @return 成功发送的设备数量
+     */
+    public int sendAudioToAll(byte[] audioData) {
+        int count = 0;
+        BinaryMessage binaryMessage = new BinaryMessage(audioData);
+        for (Map.Entry<String, WebSocketSession> entry : sessions.entrySet()) {
+            WebSocketSession session = entry.getValue();
+            if (session.isOpen()) {
+                try {
+                    session.sendMessage(binaryMessage);
+                    count++;
+                    log.debug("发送音频数据到设备, sessionId={}, 数据大小={} bytes", entry.getKey(), audioData.length);
+                } catch (Exception e) {
+                    log.error("发送音频数据失败, sessionId={}", entry.getKey(), e);
+                }
+            }
+        }
+        return count;
+    }
+
+    /**
+     * 向所有已连接的ESP32设备发送文本消息
+     * @param text 文本内容
+     */
+    public void sendTextToAll(String text) {
+        TextMessage textMessage = new TextMessage(text);
+        for (Map.Entry<String, WebSocketSession> entry : sessions.entrySet()) {
+            WebSocketSession session = entry.getValue();
+            if (session.isOpen()) {
+                try {
+                    session.sendMessage(textMessage);
+                } catch (Exception e) {
+                    log.error("发送文本消息失败, sessionId={}", entry.getKey(), e);
+                }
+            }
+        }
+    }
+
+    /**
+     * 获取所有在线会话ID
+     */
+    public java.util.Set<String> getOnlineSessionIds() {
+        return sessions.keySet();
     }
 }

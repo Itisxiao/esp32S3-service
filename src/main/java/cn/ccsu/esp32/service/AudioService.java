@@ -9,6 +9,7 @@ import java.io.IOException;
 import java.text.SimpleDateFormat;
 import java.util.Date;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -29,11 +30,19 @@ public class AudioService {
     /** 每个会话对应的文件名 */
     private final Map<String, String> sessionFileNames = new ConcurrentHashMap<>();
 
+    /** 已显式停止录音的会话集合，防止残余数据触发自动重启 */
+    private final Set<String> stoppedSessions = ConcurrentHashMap.newKeySet();
+
+    /** 正在录音的会话集合 */
+    private final Set<String> recordingSessions = ConcurrentHashMap.newKeySet();
+
     /**
      * 开始录音 - 为会话创建音频文件
      * @param sessionId WebSocket会话ID
      */
     public void startRecording(String sessionId) {
+        stoppedSessions.remove(sessionId);
+        recordingSessions.add(sessionId);
         try {
             File dir = new File(AUDIO_DIR);
             if (!dir.exists()) {
@@ -57,6 +66,10 @@ public class AudioService {
      * @param audioData 音频二进制数据
      */
     public void writeAudioData(String sessionId, byte[] audioData) {
+        if (!recordingSessions.contains(sessionId)) {
+            log.debug("会话未在录音中，丢弃音频数据, sessionId={}, 数据大小={} bytes", sessionId, audioData.length);
+            return;
+        }
         FileOutputStream fos = sessionStreams.get(sessionId);
         if (fos != null) {
             try {
@@ -66,9 +79,7 @@ public class AudioService {
                 log.error("写入音频数据失败, sessionId={}", sessionId, e);
             }
         } else {
-            log.warn("未找到录音流, sessionId={}, 自动开启录音", sessionId);
-            startRecording(sessionId);
-            writeAudioData(sessionId, audioData);
+            log.warn("录音流已关闭但会话仍在录音中, sessionId={}", sessionId);
         }
     }
 
@@ -78,6 +89,8 @@ public class AudioService {
      * @return 录音文件路径，如果没有则返回null
      */
     public String stopRecording(String sessionId) {
+        recordingSessions.remove(sessionId);
+        stoppedSessions.add(sessionId);
         String filePath = sessionFileNames.remove(sessionId);
         FileOutputStream fos = sessionStreams.remove(sessionId);
         if (fos != null) {
