@@ -6,14 +6,18 @@ import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.http.HttpMethod;
+import org.springframework.http.client.ClientHttpResponse;
+import org.springframework.web.client.ResponseExtractor;
 import org.springframework.web.client.RestTemplate;
 
 import javax.annotation.PreDestroy;
 import javax.annotation.Resource;
+import java.io.BufferedInputStream;
+import java.io.InputStream;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -73,8 +77,11 @@ public class AudioController {
      */
     private final LinkedBlockingQueue<byte[]> chunkQueue = new LinkedBlockingQueue<>(QUEUE_CAPACITY);
 
-    /** 是否正在推送中，防止重复触发 */
-    private final AtomicBoolean pushing = new AtomicBoolean(false);
+    /** 当前活跃的下载任务 Future，用于取消旧推送 */
+    private volatile Future<?> activeDownloadTask = null;
+
+    /** 当前活跃的推送ID，消费者只认这个ID */
+    private volatile String activePushId = null;
 
     /** 统计：已发送块数 */
     private final AtomicInteger totalSent = new AtomicInteger(0);
@@ -87,9 +94,6 @@ public class AudioController {
 
     /** 当前推送的总块数（用于完成判定） */
     private final AtomicInteger totalChunksExpected = new AtomicInteger(0);
-
-    /** 当前推送的会话标识（用于日志） */
-    private volatile String currentPushId = null;
 
     // ==================== 初始化 ====================
 
@@ -125,18 +129,15 @@ public class AudioController {
             return result;
         }
 
-        // 防止并发推送
-        if (!pushing.compareAndSet(false, true)) {
-            result.put("success", false);
-            result.put("message", "已有推送任务正在进行中，请等待完成");
-            return result;
-        }
-
         String pushId = java.util.UUID.randomUUID().toString().substring(0, 8);
-        currentPushId = pushId;
+
+        // 取消旧的下载任务并清空队列残留
+        cancelPreviousPush(pushId);
+
+        activePushId = pushId;
 
         // 异步下载 + 填充队列
-        downloadExecutor.submit(() -> loadAndEnqueue(url, pushId, onlineCount));
+        activeDownloadTask = downloadExecutor.submit(() -> loadAndEnqueue(url, pushId, onlineCount));
 
         result.put("success", true);
         result.put("message", "音频推送已启动");
@@ -151,73 +152,162 @@ public class AudioController {
     // ==================== 核心逻辑 ====================
 
     /**
-     * 【生产者】下载音频 → 分块 → 填充队列。
+     * 取消上一次推送：中断下载线程 + 清空队列 + 重置状态。
+     * 新推送调用前必须先执行此方法，确保旧的消费者不会再误触 finishPush。
+     */
+    private void cancelPreviousPush(String newPushId) {
+        // 1. 切换 activePushId，让消费者 sendNextChunk 不再为旧推送调用 finishPush
+        String oldPushId = activePushId;
+        if (oldPushId != null) {
+            log.info("[push:{}] 检测到旧推送[{}]，取消并清空队列", newPushId, oldPushId);
+        }
+
+        // 2. 中断旧的下载任务
+        Future<?> oldTask = activeDownloadTask;
+        if (oldTask != null && !oldTask.isDone()) {
+            oldTask.cancel(true);
+            log.debug("[push:{}] 已中断旧下载线程", newPushId);
+        }
+
+        // 3. 清空队列中残留的旧音频块
+        int discarded = chunkQueue.size();
+        chunkQueue.clear();
+        if (discarded > 0) {
+            log.info("[push:{}] 清空队列残留{}块", newPushId, discarded);
+        }
+    }
+
+    /**
+     * 【生产者】流式下载音频 → 分块 → 填充队列。
+     * 使用 InputStream 边下载边分块入队，避免将整个文件加载到内存。
      * 队列满时 offer 超时等待（背压），超时过久则放弃本次推送。
      */
     private void loadAndEnqueue(String url, String pushId, int deviceCount) {
         try {
-            // 1. 下载音频
-            byte[] audioData = restTemplate.getForObject(url, byte[].class);
-            if (audioData == null || audioData.length == 0) {
-                log.warn("[push:{}] 音频文件为空或下载失败", pushId);
-                pushing.set(false);
-                return;
-            }
-
-            int totalChunks = (audioData.length + CHUNK_SIZE - 1) / CHUNK_SIZE;
-            totalChunksExpected.set(totalChunks);
+            // 重置统计
             totalSent.set(0);
             underrunCount.set(0);
             pushStartTime.set(System.currentTimeMillis());
 
-            log.info("[push:{}] 下载完成, 大小={} bytes, 共{}块, 开始填充队列(容量={})",
-                    pushId, audioData.length, totalChunks, QUEUE_CAPACITY);
+            log.info("[push:{}] 开始流式下载, url={}", pushId, url);
 
-            // 2. 分块入队
-            for (int i = 0; i < totalChunks; i++) {
-                int offset = i * CHUNK_SIZE;
-                int length = Math.min(CHUNK_SIZE, audioData.length - offset);
-                byte[] chunk = new byte[length];
-                System.arraycopy(audioData, offset, chunk, 0, length);
+            // 使用 RestTemplate execute 获取 InputStream，边读边分块入队
+            Integer totalChunks = restTemplate.execute(url, HttpMethod.GET, null, (ResponseExtractor<Integer>) response -> {
+                long contentLength = response.getHeaders().getContentLength();
+                int estimatedChunks = contentLength > 0
+                        ? (int) ((contentLength + CHUNK_SIZE - 1) / CHUNK_SIZE)
+                        : -1;
+                totalChunksExpected.set(Math.max(estimatedChunks, 0));
 
-                // 背压：队列满时阻塞等待，直到超时
-                boolean offered = chunkQueue.offer(chunk, ENQUEUE_TIMEOUT_MS, TimeUnit.MILLISECONDS);
-                if (!offered) {
-                    log.warn("[push:{}] 队列持续满超过{}ms，放弃剩余{}块",
-                            pushId, ENQUEUE_TIMEOUT_MS, totalChunks - i);
-                    break;
+                log.info("[push:{}] 响应头已到达, Content-Length={} bytes, 预估{}块, 开始流式读取",
+                        pushId, contentLength, estimatedChunks);
+
+                try (InputStream raw = response.getBody();
+                     BufferedInputStream bis = new BufferedInputStream(raw, CHUNK_SIZE * 4)) {
+
+                    int chunkIndex = 0;
+                    byte[] buffer = new byte[CHUNK_SIZE];
+
+                    while (!Thread.currentThread().isInterrupted()) {
+                        int bytesRead = readFully(bis, buffer);
+                        if (bytesRead <= 0) {
+                            break;
+                        }
+
+                        // 如果已被新推送取代，立即停止
+                        if (!pushId.equals(activePushId)) {
+                            log.info("[push:{}] 已被新推送取代，停止入队 (已入队{}块)", pushId, chunkIndex);
+                            break;
+                        }
+
+                        // 如果实际读到的不足 CHUNK_SIZE，拷贝精确长度
+                        byte[] chunk;
+                        if (bytesRead < CHUNK_SIZE) {
+                            chunk = new byte[bytesRead];
+                            System.arraycopy(buffer, 0, chunk, 0, bytesRead);
+                        } else {
+                            chunk = new byte[CHUNK_SIZE];
+                            System.arraycopy(buffer, 0, chunk, 0, CHUNK_SIZE);
+                        }
+
+                        // 背压：队列满时阻塞等待，直到超时
+                        boolean offered;
+                        try {
+                            offered = chunkQueue.offer(chunk, ENQUEUE_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            log.info("[push:{}] 入队被中断（可能已被新推送取消）, 已入队{}块", pushId, chunkIndex);
+                            break;
+                        }
+                        if (!offered) {
+                            log.warn("[push:{}] 队列持续满超过{}ms，放弃剩余块", pushId, ENQUEUE_TIMEOUT_MS);
+                            break;
+                        }
+
+                        chunkIndex++;
+
+                        // 周期性打印队列状态
+                        if (chunkIndex % 50 == 0) {
+                            log.debug("[push:{}] 已入队{}块, 队列深度={}/{}",
+                                    pushId, chunkIndex, chunkQueue.size(), QUEUE_CAPACITY);
+                        }
+                    }
+
+                    // 如果之前无法预估总块数，现在补设
+                    if (estimatedChunks <= 0) {
+                        totalChunksExpected.set(chunkIndex);
+                    }
+
+                    log.info("[push:{}] 流式读取完毕, 共入队{}块", pushId, chunkIndex);
+                    return chunkIndex;
                 }
+            });
 
-                // 周期性打印队列状态
-                if ((i + 1) % 50 == 0) {
-                    log.debug("[push:{}] 已入队{}/{}块, 队列深度={}/{}",
-                            pushId, i + 1, totalChunks, chunkQueue.size(), QUEUE_CAPACITY);
-                }
-            }
-
-            log.info("[push:{}] 全部块已入队, 共{}块, 等待发送线程消费完毕", pushId, totalChunks);
+            log.info("[push:{}] 下载+入队完成, 共{}块, 等待发送线程消费完毕", pushId, totalChunks);
 
         } catch (Exception e) {
-            log.error("[push:{}] 音频加载失败", pushId, e);
-            pushing.set(false);
+            if (Thread.currentThread().isInterrupted() || !pushId.equals(activePushId)) {
+                log.info("[push:{}] 下载任务被取消（被新推送取代）", pushId);
+            } else {
+                log.error("[push:{}] 音频流式加载失败", pushId, e);
+            }
         }
+    }
+
+    /**
+     * 从 InputStream 尽量读满 buffer。
+     * 返回实际读取的字节数，-1 表示已到流末尾。
+     */
+    private int readFully(InputStream in, byte[] buffer) throws java.io.IOException {
+        int totalRead = 0;
+        while (totalRead < buffer.length) {
+            int n = in.read(buffer, totalRead, buffer.length - totalRead);
+            if (n == -1) {
+                return totalRead > 0 ? totalRead : -1;
+            }
+            totalRead += n;
+        }
+        return totalRead;
     }
 
     /**
      * 【消费者】定时发送线程的核心方法，每 50ms 调用一次。
      * 从队列 poll 一块音频数据并发送给所有设备。
      * 队列空时跳过（计入 underrun），不阻塞定时线程。
+     * 只处理与当前 activePushId 匹配的推送，避免旧推送干扰新推送。
      */
     private void sendNextChunk() {
+        String pushId = activePushId;
+
         // 队列为空时直接跳过
         byte[] chunk = chunkQueue.poll();
         if (chunk == null) {
-            // 如果不在推送中，静默跳过；如果正在推送但队列空，计为 underrun
-            if (pushing.get()) {
+            // 如果正在推送但队列空，计为 underrun
+            if (pushId != null) {
                 underrunCount.incrementAndGet();
                 // 检查是否所有块都已发完
-                if (totalSent.get() >= totalChunksExpected.get()) {
-                    finishPush();
+                if (totalSent.get() >= totalChunksExpected.get() && totalChunksExpected.get() > 0) {
+                    finishPush(pushId);
                 }
             }
             return;
@@ -227,31 +317,41 @@ public class AudioController {
             int sentTo = audioWebSocketHandler.sendAudioToAll(chunk);
             int sent = totalSent.incrementAndGet();
 
-            if (sentTo == 0 && pushing.get()) {
+            if (sentTo == 0 && pushId != null) {
                 log.warn("[push:{}] 无可用设备, 已发送{}/{}块",
-                        currentPushId, sent, totalChunksExpected.get());
-                // 清空队列，结束推送
+                        pushId, sent, totalChunksExpected.get());
                 chunkQueue.clear();
-                finishPush();
+                finishPush(pushId);
                 return;
             }
 
             // 所有块发送完毕
-            if (sent >= totalChunksExpected.get()) {
-                finishPush();
+            if (pushId != null && sent >= totalChunksExpected.get() && totalChunksExpected.get() > 0) {
+                finishPush(pushId);
             }
         } catch (Exception e) {
-            log.error("[push:{}] 发送音频块失败", currentPushId, e);
+            log.error("[push:{}] 发送音频块失败", pushId, e);
         }
     }
 
     /**
      * 推送完成，打印统计信息并重置状态。
+     * 只有当 pushId 仍然等于 activePushId 时才执行，防止旧推送干扰新推送。
      */
-    private void finishPush() {
-        if (!pushing.compareAndSet(true, false)) {
-            return; // 防止重复触发
+    private void finishPush(String pushId) {
+        // 原子性地检查并清除：只有当前活跃推送才允许 finish
+        if (pushId == null || !pushId.equals(activePushId)) {
+            return;
         }
+        // 用 synchronized 确保只有一个线程能完成 finish
+        synchronized (this) {
+            if (!pushId.equals(activePushId)) {
+                return;
+            }
+            activePushId = null;
+            activeDownloadTask = null;
+        }
+
         long elapsed = System.currentTimeMillis() - pushStartTime.get();
         int expected = totalChunksExpected.get();
         int sent = totalSent.get();
@@ -259,10 +359,10 @@ public class AudioController {
         long theoretical = (long) expected * CHUNK_INTERVAL_MS;
 
         log.info("[push:{}] 推送完成, 发送{}/{}块, 耗时{}ms (理论{}ms), underrun次数={}, 队列剩余={}",
-                currentPushId, sent, expected, elapsed, theoretical, underruns, chunkQueue.size());
+                pushId, sent, expected, elapsed, theoretical, underruns, chunkQueue.size());
 
         if (underruns > 0) {
-            log.warn("[push:{}] 出现{}次underrun，考虑增大队列容量或检查网络延迟", currentPushId, underruns);
+            log.warn("[push:{}] 出现{}次underrun，考虑增大队列容量或检查网络延迟", pushId, underruns);
         }
     }
 
