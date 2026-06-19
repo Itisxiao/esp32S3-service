@@ -136,6 +136,11 @@ public class AudioController {
 
         activePushId = pushId;
 
+        totalSent.set(0);
+        underrunCount.set(0);
+        pushStartTime.set(System.currentTimeMillis());
+        totalChunksExpected.set(0);
+
         // 异步下载 + 填充队列
         activeDownloadTask = downloadExecutor.submit(() -> loadAndEnqueue(url, pushId, onlineCount));
 
@@ -184,11 +189,6 @@ public class AudioController {
      */
     private void loadAndEnqueue(String url, String pushId, int deviceCount) {
         try {
-            // 重置统计
-            totalSent.set(0);
-            underrunCount.set(0);
-            pushStartTime.set(System.currentTimeMillis());
-
             log.info("[push:{}] 开始流式下载, url={}", pushId, url);
 
             // 使用 RestTemplate execute 获取 InputStream，边读边分块入队
