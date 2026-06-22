@@ -5,6 +5,9 @@ spring:
   application:
     name: esp32-audio-server
 
+tts:
+  server-url: http://localhost:8000
+
 logging:
   level:
     cn.ccsu.esp32: DEBUG
