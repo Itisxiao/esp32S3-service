@@ -6,11 +6,13 @@ import org.springframework.stereotype.Component;
 import org.springframework.web.socket.BinaryMessage;
 import org.springframework.web.socket.CloseStatus;
 import org.springframework.web.socket.TextMessage;
+import org.springframework.web.socket.WebSocketMessage;
 import org.springframework.web.socket.WebSocketSession;
 import org.springframework.web.socket.handler.AbstractWebSocketHandler;
 
 import javax.annotation.PreDestroy;
 import javax.annotation.Resource;
+import java.nio.ByteBuffer;
 import java.util.Map;
 import java.util.concurrent.*;
 
@@ -57,7 +59,7 @@ public class AudioWebSocketHandler extends AbstractWebSocketHandler {
 
         private final String sessionId;
         private final WebSocketSession session;
-        private final LinkedBlockingQueue<byte[]> sendQueue = new LinkedBlockingQueue<>(SEND_QUEUE_CAPACITY);
+        private final LinkedBlockingQueue<WebSocketMessage<?>> sendQueue = new LinkedBlockingQueue<>(SEND_QUEUE_CAPACITY);
         private volatile boolean running = true;
 
         DeviceSender(String sessionId, WebSocketSession session) {
@@ -66,14 +68,14 @@ public class AudioWebSocketHandler extends AbstractWebSocketHandler {
         }
 
         /**
-         * 非阻塞入队：队列满时丢弃最旧数据（offer 失败则 poll 头部再重试）。
+         * 非阻塞入队：队列满时丢弃最旧消息（offer 失败则 poll 头部再重试）。
          * 确保调用线程（50ms 定时器）绝不阻塞。
          */
-        void enqueue(byte[] chunk) {
+        void enqueue(WebSocketMessage<?> message) {
             if (!running) return;
-            if (!sendQueue.offer(chunk)) {
-                sendQueue.poll(); // 丢弃最旧的一块
-                sendQueue.offer(chunk);
+            if (!sendQueue.offer(message)) {
+                sendQueue.poll(); // 丢弃最旧的一条消息
+                sendQueue.offer(message);
             }
         }
 
@@ -84,16 +86,16 @@ public class AudioWebSocketHandler extends AbstractWebSocketHandler {
         void sendLoop() {
             while (running && session.isOpen()) {
                 try {
-                    byte[] chunk = sendQueue.poll(100, TimeUnit.MILLISECONDS);
-                    if (chunk != null) {
-                        session.sendMessage(new BinaryMessage(chunk));
+                    WebSocketMessage<?> message = sendQueue.poll(100, TimeUnit.MILLISECONDS);
+                    if (message != null) {
+                        session.sendMessage(message);
                     }
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     break;
                 } catch (Exception e) {
                     if (running) {
-                        log.error("[device:{}] 发送音频数据失败", sessionId, e);
+                        log.error("[device:{}] 发送WebSocket消息失败", sessionId, e);
                     }
                     break;
                 }
@@ -124,7 +126,9 @@ public class AudioWebSocketHandler extends AbstractWebSocketHandler {
 
     @Override
     protected void handleBinaryMessage(WebSocketSession session, BinaryMessage message) {
-        byte[] audioData = message.getPayload().array();
+        ByteBuffer payload = message.getPayload();
+        byte[] audioData = new byte[payload.remaining()];
+        payload.get(audioData);
         String sessionId = session.getId();
         audioService.writeAudioData(sessionId, audioData);
         log.debug("收到音频数据, sessionId={}, 数据大小={} bytes", sessionId, audioData.length);
@@ -140,7 +144,7 @@ public class AudioWebSocketHandler extends AbstractWebSocketHandler {
             if (payload.contains("\"start\"")) {
                 log.info("执行开始录音, sessionId={}", sessionId);
                 audioService.startRecording(sessionId);
-                session.sendMessage(new TextMessage("{\"status\":\"recording\"}"));
+                sendTextToSession(sessionId, "{\"status\":\"recording\"}");
             } else if (payload.contains("\"stop\"")) {
                 log.info("执行停止录音, sessionId={}", sessionId);
                 String filePath = audioService.stopRecording(sessionId);
@@ -148,7 +152,7 @@ public class AudioWebSocketHandler extends AbstractWebSocketHandler {
                 String response = filePath != null
                         ? "{\"status\":\"stopped\",\"file\":\"" + filePath + "\"}"
                         : "{\"status\":\"stopped\",\"file\":null}";
-                session.sendMessage(new TextMessage(response));
+                sendTextToSession(sessionId, response);
             } else {
                 log.warn("未识别的控制指令, sessionId={}, payload={}", sessionId, payload);
             }
@@ -208,7 +212,7 @@ public class AudioWebSocketHandler extends AbstractWebSocketHandler {
         for (Map.Entry<String, DeviceSender> entry : deviceSenders.entrySet()) {
             DeviceSender sender = entry.getValue();
             if (sender.running && sender.session.isOpen()) {
-                sender.enqueue(audioData);
+                sender.enqueue(new BinaryMessage(audioData));
                 count++;
             }
         }
@@ -220,17 +224,24 @@ public class AudioWebSocketHandler extends AbstractWebSocketHandler {
      * @param text 文本内容
      */
     public void sendTextToAll(String text) {
-        TextMessage textMessage = new TextMessage(text);
-        for (Map.Entry<String, WebSocketSession> entry : sessions.entrySet()) {
-            WebSocketSession session = entry.getValue();
-            if (session.isOpen()) {
-                try {
-                    session.sendMessage(textMessage);
-                } catch (Exception e) {
-                    log.error("发送文本消息失败, sessionId={}", entry.getKey(), e);
-                }
+        for (Map.Entry<String, DeviceSender> entry : deviceSenders.entrySet()) {
+            DeviceSender sender = entry.getValue();
+            if (sender.running && sender.session.isOpen()) {
+                sender.enqueue(new TextMessage(text));
             }
         }
+    }
+
+    /**
+     * 向指定会话发送文本消息，统一进入设备发送队列，避免并发写同一个 WebSocketSession。
+     */
+    private void sendTextToSession(String sessionId, String text) {
+        DeviceSender sender = deviceSenders.get(sessionId);
+        if (sender == null || !sender.running || !sender.session.isOpen()) {
+            log.warn("发送文本消息失败，会话不可用, sessionId={}", sessionId);
+            return;
+        }
+        sender.enqueue(new TextMessage(text));
     }
 
     /**
@@ -248,4 +259,3 @@ public class AudioWebSocketHandler extends AbstractWebSocketHandler {
         deviceSendExecutor.shutdownNow();
     }
 }
-
